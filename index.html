@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mr Dino Run</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <main class="game-shell">
+        <header class="hud">
+            <div class="stat-card">
+                <p class="stat-label">Score</p>
+                <p class="stat-value" id="score">0</p>
+            </div>
+            <div class="stat-card">
+                <p class="stat-label">Speed</p>
+                <p class="stat-value">
+                    x<span id="speed-multiplier">1.0</span>
+                </p>
+                <span id="speed-kmh" class="speed-kmh">0 km/h</span>
+            </div>
+            <div class="stat-card">
+                <p class="stat-label">Effect</p>
+                <p class="stat-value" id="effect-name">None</p>
+            </div>
+            <div class="stat-card player-card">
+                <p class="stat-label">Runner</p>
+                <div class="player-chip">
+                    <span id="player-display">Not set</span>
+                    <button id="edit-name-btn" type="button" aria-label="Edit runner name">Edit</button>
+                </div>
+            </div>
+            <div class="stat-card lives-card" aria-label="Lives remaining">
+                <p class="stat-label">Lives</p>
+                <div class="lives-display">
+                    <span class="heart-icon" aria-hidden="true"></span>
+                    <span id="lives-count">3</span>
+                </div>
+            </div>
+        </header>
+        <canvas id="game-canvas" width="1280" height="380" aria-label="Mr Dino endless runner" role="img">
+            Your browser does not support the canvas element.
+        </canvas>
+        <section class="controls">
+            <p>Press <strong>Space</strong> or tap to jump. Survive as long as you can!</p>
+            <button id="start-button" type="button">Start / Restart</button>
+        </section>
+        <section class="leaderboard">
+            <header class="leaderboard-header">
+                <h2>Global Leaderboard</h2>
+                <button id="refresh-leaderboard" type="button" aria-label="Refresh leaderboard">↻</button>
+            </header>
+            <ol id="leaderboard-list" class="leaderboard-list">
+                <li>Fetching latest scores…</li>
+            </ol>
+            <p class="leaderboard-note">Scores auto-submit when a run ends. Only your best runs make the list!</p>
+        </section>
+    </main>
+
+    <div id="name-overlay" class="name-overlay" aria-hidden="true">
+        <form id="name-form" class="name-form" autocomplete="off">
+            <h2>Welcome to Mr Dino Run</h2>
+            <p>Enter the name you want to show on the leaderboard.</p>
+            <label for="player-name" class="sr-only">Player name</label>
+            <input id="player-name" name="player-name" type="text" maxlength="30" placeholder="e.g. WinterRunner" required>
+            <p id="name-error" class="name-error" role="alert"></p>
+            <button type="submit">Save Name &amp; Play</button>
+        </form>
+    </div>
+
+    <audio id="jump-sound" src="assets/sfx/jump.wav" preload="auto"></audio>
+    <audio id="score-sound" src="assets/sfx/checkpoint.wav" preload="auto"></audio>
+
+    <script src="game.js" defer></script>
+</body>
+</html>
