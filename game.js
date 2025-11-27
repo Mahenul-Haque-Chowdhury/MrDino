@@ -49,13 +49,20 @@ const CONFIG = {
     difficultyStepScore: 2500,
     minObstacleGap: 120,
     spawnRules: {
-        baseIntervalMs: 1450,
-        minIntervalMs: 700,
-        intervalVariance: 0.2,
-        intervalFalloffPerDifficulty: 55,
-        safeMinGap: 220,
-        gapDecayPerDifficulty: 4,
+        baseIntervalMs: 1500,
+        minIntervalMs: 850,
+        intervalVariance: 0.25,
+        difficultyRampMs: 45,
+        safeMinGap: 240,
+        gapDecayPerDifficulty: 5,
         maxSameTypeStreak: 2,
+        maxActiveObstacles: 2,
+        globalCooldownMs: 320,
+        laneCooldownMs: {
+            ground: 420,
+            aerial: 520,
+            vertical: 560,
+        },
     },
     laneLimits: {
         ground: 1,
@@ -267,8 +274,23 @@ const SPAWN_STATE = {
     lastType: null,
     repeatCount: 0,
 };
-const patternQueue = [];
-let patternQueueDelayMs = 0;
+const LANE_KEYS = ["ground", "aerial", "vertical"];
+
+function createLaneLockMap() {
+    return LANE_KEYS.reduce((locks, lane) => {
+        locks[lane] = 0;
+        return locks;
+    }, {});
+}
+
+const SPAWN_MANAGER = {
+    queue: [],
+    delayMs: 0,
+    laneLocks: createLaneLockMap(),
+    globalLockUntil: 0,
+};
+
+let nextSpeedMilestoneScore = CONFIG.milestoneScore;
 
 let lastTimestamp = 0;
 let globalTimeMs = 0;
@@ -311,6 +333,7 @@ function resetRunState({ preserveScore = false, preserveSpeed = false } = {}) {
     }
     if (!preserveSpeed) {
         GAME_STATE.speedMultiplier = 1;
+        nextSpeedMilestoneScore = CONFIG.milestoneScore;
     }
 
     obstacles.length = 0;
@@ -338,10 +361,7 @@ function resetRunState({ preserveScore = false, preserveSpeed = false } = {}) {
     globalTimeMs = 0;
 
     patternCooldownMs = 0;
-    SPAWN_STATE.lastType = null;
-    SPAWN_STATE.repeatCount = 0;
-    patternQueue.length = 0;
-    patternQueueDelayMs = 0;
+    resetSpawnQueues({ clearHistory: true });
     updateEffectLabel();
 }
 
@@ -351,6 +371,7 @@ function resetGame() {
     initializePowerupSchedule();
     scheduleNextPattern(0);
     lastLifeBonusMilestone = 0;
+    nextSpeedMilestoneScore = CONFIG.milestoneScore;
     resetRunState();
 }
 
@@ -398,13 +419,10 @@ function initializePowerupSchedule() {
 function scheduleNextSpawn() {
     const rules = CONFIG.spawnRules;
     const difficulty = getDifficultyLevel();
-    const speedMultiplier = getEffectiveSpeedMultiplier();
-    const falloff = difficulty * rules.intervalFalloffPerDifficulty;
+    const falloff = difficulty * (rules.difficultyRampMs ?? 0);
     const baseInterval = Math.max(rules.minIntervalMs, rules.baseIntervalMs - falloff);
-    const speedFactor = 0.85 + speedMultiplier * 0.15;
     const variance = randomBetween(1 - rules.intervalVariance, 1 + rules.intervalVariance);
-    const interval = Math.max(rules.minIntervalMs, (baseInterval / speedFactor) * variance);
-    spawnCountdownMs = interval;
+    spawnCountdownMs = Math.max(rules.minIntervalMs, baseInterval * variance);
 }
 
 function spawnObstacle(templateOverride = null, options = {}) {
@@ -417,6 +435,9 @@ function spawnObstacle(templateOverride = null, options = {}) {
     const template = templateOverride ?? weightedRandom(candidates);
     if (!template) return null;
     if (!options.ignoreLaneLimit && !canSpawnInLane(template.lane ?? "ground")) {
+        return null;
+    }
+    if (!options.ignoreLocks && !canSpawnWithLocks(template)) {
         return null;
     }
 
@@ -475,6 +496,9 @@ function spawnObstacle(templateOverride = null, options = {}) {
     }
 
     obstacles.push(obstacle);
+    if (!options.ignoreLocks) {
+        recordSpawnLocks(template);
+    }
     return obstacle;
 }
 
@@ -552,14 +576,59 @@ function getObstacleTemplateByName(name) {
     return OBSTACLE_TYPES.find((type) => type.name === name) ?? null;
 }
 
-function getFurthestObstacleEdge() {
-    if (!obstacles.length) return -Infinity;
-    return obstacles.reduce((max, obs) => Math.max(max, obs.x + obs.width), -Infinity);
-}
-
 function getPatternOrigin(extraGap = CONFIG.minObstacleGap) {
     const ahead = Math.max(WORLD.width + 160, getFurthestObstacleEdge() + extraGap);
     return ahead;
+}
+
+function resetSpawnQueues({ clearHistory = false } = {}) {
+    SPAWN_MANAGER.queue.length = 0;
+    SPAWN_MANAGER.delayMs = 0;
+    SPAWN_MANAGER.globalLockUntil = 0;
+    for (const lane of LANE_KEYS) {
+        SPAWN_MANAGER.laneLocks[lane] = 0;
+    }
+    if (clearHistory) {
+        SPAWN_STATE.lastType = null;
+        SPAWN_STATE.repeatCount = 0;
+    }
+}
+
+function getActiveObstacleCount() {
+    let count = 0;
+    for (const obstacle of obstacles) {
+        if (!obstacle.passed) {
+            count += 1;
+        }
+    }
+    return count;
+}
+
+function canSpawnWithLocks(template) {
+    const rules = CONFIG.spawnRules;
+    if (!template) return false;
+    if (rules.maxActiveObstacles && getActiveObstacleCount() >= rules.maxActiveObstacles) {
+        return false;
+    }
+    if (globalTimeMs < SPAWN_MANAGER.globalLockUntil) {
+        return false;
+    }
+    const lane = template.lane ?? "ground";
+    const laneLock = SPAWN_MANAGER.laneLocks[lane] ?? 0;
+    if (globalTimeMs < laneLock) {
+        return false;
+    }
+    return true;
+}
+
+function recordSpawnLocks(template) {
+    const rules = CONFIG.spawnRules;
+    const lane = template.lane ?? "ground";
+    const laneCooldowns = rules.laneCooldownMs ?? {};
+    const laneCooldown = laneCooldowns[lane] ?? laneCooldowns.default ?? 320;
+    SPAWN_MANAGER.laneLocks[lane] = globalTimeMs + laneCooldown;
+    const globalCooldown = rules.globalCooldownMs ?? 300;
+    SPAWN_MANAGER.globalLockUntil = globalTimeMs + globalCooldown;
 }
 
 function canSpawnInLane(lane) {
@@ -579,36 +648,42 @@ function canSpawnInLane(lane) {
 
 function enqueuePatternSequence(entries = [], initialDelayMs = 0) {
     if (!entries.length) return;
-    const wasIdle = patternQueue.length === 0;
-    patternQueue.push(...entries);
+    const wasIdle = SPAWN_MANAGER.queue.length === 0;
+    SPAWN_MANAGER.queue.push(...entries);
     if (wasIdle) {
-        patternQueueDelayMs = Math.max(0, initialDelayMs);
+        SPAWN_MANAGER.delayMs = Math.max(0, initialDelayMs);
     }
 }
 
-function processPatternQueue(deltaMs) {
-    if (!patternQueue.length) return false;
-    patternQueueDelayMs = Math.max(0, patternQueueDelayMs - deltaMs);
-    if (patternQueueDelayMs > 0) return true;
-    const next = patternQueue.shift();
+function processSpawnQueue(deltaMs) {
+    if (!SPAWN_MANAGER.queue.length) return false;
+    SPAWN_MANAGER.delayMs = Math.max(0, SPAWN_MANAGER.delayMs - deltaMs);
+    if (SPAWN_MANAGER.delayMs > 0) return true;
+    const next = SPAWN_MANAGER.queue[0];
     const template = typeof next.templateName === "string" ? getObstacleTemplateByName(next.templateName) : next.templateName;
     const options = typeof next.buildOptions === "function" ? next.buildOptions() : { ...(next.options ?? {}) };
-    if (template) {
-        const spawned = spawnObstacle(template, options ?? {});
-        if (!spawned) {
-            patternQueue.unshift(next);
-            patternQueueDelayMs = Math.max(80, next.waitMs ?? 120);
-            return true;
-        }
+
+    if (!template) {
+        SPAWN_MANAGER.queue.shift();
+        SPAWN_MANAGER.delayMs = next?.waitMs ?? 0;
+        return SPAWN_MANAGER.queue.length > 0 || SPAWN_MANAGER.delayMs > 0;
     }
-    patternQueueDelayMs = next.waitMs ?? 0;
-    return patternQueue.length > 0 || patternQueueDelayMs > 0;
+
+    const spawned = spawnObstacle(template, options ?? {});
+    if (spawned) {
+        SPAWN_MANAGER.queue.shift();
+        SPAWN_MANAGER.delayMs = next.waitMs ?? 0;
+        recordSpawnHistory(template.name);
+    } else {
+        SPAWN_MANAGER.delayMs = Math.max(90, next.waitMs ?? 150);
+    }
+    return SPAWN_MANAGER.queue.length > 0 || SPAWN_MANAGER.delayMs > 0;
 }
 
 function spawnTreeVolley() {
-    const spacing = 260;
+    const spacing = 320;
     const entries = [];
-    for (let i = 0; i < 3; i += 1) {
+    for (let i = 0; i < 2; i += 1) {
         const templateName = i % 2 === 0 ? "tree-double" : "tree-single";
         const offsetIndex = i;
         entries.push({
@@ -620,7 +695,7 @@ function spawnTreeVolley() {
                     minGap: template?.minGap ?? CONFIG.minObstacleGap,
                 };
             },
-            waitMs: 240,
+            waitMs: 320,
         });
     }
     enqueuePatternSequence(entries);
@@ -629,7 +704,7 @@ function spawnTreeVolley() {
 function spawnPterodactylChase() {
     const template = getObstacleTemplateByName("pterodactyl");
     if (!template) return;
-    const spacing = 240;
+    const spacing = 280;
     const flockSize = 2; // keep aerial formations manageable
     const entries = [];
     for (let i = 0; i < flockSize; i += 1) {
@@ -645,7 +720,7 @@ function spawnPterodactylChase() {
                     speedOffset: -40 + offsetIndex * 20,
                 };
             },
-            waitMs: 220,
+            waitMs: 260,
         });
     }
     enqueuePatternSequence(entries);
@@ -654,7 +729,7 @@ function spawnPterodactylChase() {
 function spawnSnowballRush() {
     const template = getObstacleTemplateByName("snowball");
     if (!template) return;
-    const spacing = 320;
+    const spacing = 360;
     const volleySize = 2;
     const entries = [];
     for (let i = 0; i < volleySize; i += 1) {
@@ -669,7 +744,7 @@ function spawnSnowballRush() {
                     minGap: tpl.minGap,
                 };
             },
-            waitMs: 260,
+            waitMs: 320,
         });
     }
     enqueuePatternSequence(entries);
@@ -678,9 +753,9 @@ function spawnSnowballRush() {
 function spawnIcicleStorm() {
     const template = getObstacleTemplateByName("icicle");
     if (!template) return;
-    const spacing = 180;
+    const spacing = 220;
     const entries = [];
-    for (let i = 0; i < 4; i += 1) {
+    for (let i = 0; i < 3; i += 1) {
         const offsetIndex = i;
         entries.push({
             templateName: "icicle",
@@ -692,7 +767,7 @@ function spawnIcicleStorm() {
                     minGap: tpl?.minGap ?? CONFIG.minObstacleGap,
                 };
             },
-            waitMs: 180,
+            waitMs: 220,
         });
     }
     enqueuePatternSequence(entries);
@@ -701,9 +776,9 @@ function spawnIcicleStorm() {
 function spawnMeteorRain() {
     const template = getObstacleTemplateByName("meteor");
     if (!template) return;
-    const spacing = 200;
+    const spacing = 260;
     const entries = [];
-    for (let i = 0; i < 4; i += 1) {
+    for (let i = 0; i < 3; i += 1) {
         const offsetIndex = i;
         entries.push({
             templateName: "meteor",
@@ -716,13 +791,14 @@ function spawnMeteorRain() {
                     minGap: tpl?.minGap ?? CONFIG.minObstacleGap,
                 };
             },
-            waitMs: 160,
+            waitMs: 220,
         });
     }
     enqueuePatternSequence(entries);
 }
 
 function maybeTriggerPattern() {
+    if (SPAWN_MANAGER.queue.length) return;
     if (!Number.isFinite(nextPatternScore) || GAME_STATE.score < nextPatternScore) return;
     runPatternForDifficulty();
     scheduleNextPattern(GAME_STATE.score);
@@ -781,8 +857,8 @@ function update(deltaMs) {
     wasGroundedLastFrame = dino.grounded;
     dino.animationMs += clampedDelta * (dino.grounded ? getEffectiveSpeedMultiplier() : 0.6);
 
-    const patternActive = processPatternQueue(clampedDelta);
-    if (!patternActive) {
+    const queueActive = processSpawnQueue(clampedDelta);
+    if (!queueActive) {
         patternCooldownMs = Math.max(0, patternCooldownMs - clampedDelta);
         if (patternCooldownMs <= 0) {
             spawnCountdownMs -= clampedDelta;
@@ -814,13 +890,20 @@ function update(deltaMs) {
     GAME_STATE.score += scoreGain;
 
     const milestone = Math.floor(GAME_STATE.score / CONFIG.milestoneScore);
-    const targetMultiplier = Math.min(
-        CONFIG.maxSpeedMultiplier,
-        1 + milestone * CONFIG.milestoneIncrement,
-    );
+    let speedIncreased = false;
+    while (
+        GAME_STATE.score >= nextSpeedMilestoneScore &&
+        GAME_STATE.speedMultiplier < CONFIG.maxSpeedMultiplier
+    ) {
+        GAME_STATE.speedMultiplier = Math.min(
+            CONFIG.maxSpeedMultiplier,
+            GAME_STATE.speedMultiplier + CONFIG.milestoneIncrement,
+        );
+        nextSpeedMilestoneScore += CONFIG.milestoneScore;
+        speedIncreased = true;
+    }
 
-    if (targetMultiplier - GAME_STATE.speedMultiplier > 0.001) {
-        GAME_STATE.speedMultiplier = targetMultiplier;
+    if (speedIncreased) {
         scoreSound?.pause();
         if (scoreSound) scoreSound.currentTime = 0;
         scoreSound?.play().catch(() => {});
