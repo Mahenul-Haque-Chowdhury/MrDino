@@ -36,8 +36,7 @@ const CONFIG = {
     jumpVelocity: -950,
     coyoteMs: 120,
     jumpBufferMs: 150,
-    spawnInterval: { min: 0.85, max: 1.35 },
-    milestoneScore: 2000,
+    milestoneScore: 5000,
     milestoneIncrement: 0.15,
     maxSpeedMultiplier: 3,
     scoreRate: 0.25, // points per ms
@@ -49,6 +48,20 @@ const CONFIG = {
     scoreFrenzyMultiplier: 2.2,
     difficultyStepScore: 2500,
     minObstacleGap: 120,
+    spawnRules: {
+        baseIntervalMs: 1450,
+        minIntervalMs: 700,
+        intervalVariance: 0.2,
+        intervalFalloffPerDifficulty: 55,
+        safeMinGap: 220,
+        gapDecayPerDifficulty: 4,
+        maxSameTypeStreak: 2,
+    },
+    laneLimits: {
+        ground: 1,
+        aerial: 1,
+        vertical: 1,
+    },
 };
 
 const LEADERBOARD_LIMIT = 10;
@@ -71,6 +84,8 @@ const OBSTACLE_TYPES = [
         palette: evergreenPalette,
         treeLayers: 3,
         hitbox: { left: 4, right: 4, top: 2, bottom: 2 },
+        minGap: 180,
+        lane: "ground",
     },
     {
         name: "tree-double",
@@ -83,6 +98,8 @@ const OBSTACLE_TYPES = [
         palette: evergreenPalette,
         treeLayers: 4,
         hitbox: { left: 6, right: 6, top: 4, bottom: 2 },
+        minGap: 220,
+        lane: "ground",
     },
     {
         name: "pterodactyl",
@@ -93,7 +110,9 @@ const OBSTACLE_TYPES = [
         elevationRange: { min: 32, max: 90 },
         minSpeedMultiplier: 1.1,
         flutterSpeed: 280,
+        speedOffsetRange: [-30, 20],
         hitbox: { left: 4, right: 4, top: 4, bottom: 4 },
+        lane: "aerial",
     },
     {
         name: "snowball",
@@ -105,6 +124,8 @@ const OBSTACLE_TYPES = [
         rollScale: 1.2,
         hitbox: { left: 4, right: 4, top: 4, bottom: 4 },
         minDifficulty: 1,
+        minGap: 240,
+        lane: "ground",
     },
     {
         name: "icicle",
@@ -118,6 +139,7 @@ const OBSTACLE_TYPES = [
         spawnElevation: 140,
         hitbox: { left: 6, right: 6, top: 10, bottom: 6 },
         minDifficulty: 1,
+        lane: "vertical",
     },
     {
         name: "meteor",
@@ -130,6 +152,7 @@ const OBSTACLE_TYPES = [
         trailColor: "#ffb65c",
         hitbox: { left: 6, right: 6, top: 4, bottom: 8 },
         minDifficulty: 2,
+        lane: "vertical",
     },
 ];
 
@@ -240,6 +263,12 @@ const nextPowerupScore = {};
 let nextPatternScore = 0;
 let lastLifeBonusMilestone = 0;
 let patternCooldownMs = 0;
+const SPAWN_STATE = {
+    lastType: null,
+    repeatCount: 0,
+};
+const patternQueue = [];
+let patternQueueDelayMs = 0;
 
 let lastTimestamp = 0;
 let globalTimeMs = 0;
@@ -309,6 +338,10 @@ function resetRunState({ preserveScore = false, preserveSpeed = false } = {}) {
     globalTimeMs = 0;
 
     patternCooldownMs = 0;
+    SPAWN_STATE.lastType = null;
+    SPAWN_STATE.repeatCount = 0;
+    patternQueue.length = 0;
+    patternQueueDelayMs = 0;
     updateEffectLabel();
 }
 
@@ -363,10 +396,15 @@ function initializePowerupSchedule() {
 }
 
 function scheduleNextSpawn() {
-    const base = randomBetween(CONFIG.spawnInterval.min, CONFIG.spawnInterval.max);
+    const rules = CONFIG.spawnRules;
     const difficulty = getDifficultyLevel();
-    const difficultyScale = Math.max(0.45, 1 - difficulty * 0.08);
-    spawnCountdownMs = (base * difficultyScale * 1000) / getEffectiveSpeedMultiplier();
+    const speedMultiplier = getEffectiveSpeedMultiplier();
+    const falloff = difficulty * rules.intervalFalloffPerDifficulty;
+    const baseInterval = Math.max(rules.minIntervalMs, rules.baseIntervalMs - falloff);
+    const speedFactor = 0.85 + speedMultiplier * 0.15;
+    const variance = randomBetween(1 - rules.intervalVariance, 1 + rules.intervalVariance);
+    const interval = Math.max(rules.minIntervalMs, (baseInterval / speedFactor) * variance);
+    spawnCountdownMs = interval;
 }
 
 function spawnObstacle(templateOverride = null, options = {}) {
@@ -378,6 +416,9 @@ function spawnObstacle(templateOverride = null, options = {}) {
     });
     const template = templateOverride ?? weightedRandom(candidates);
     if (!template) return null;
+    if (!options.ignoreLaneLimit && !canSpawnInLane(template.lane ?? "ground")) {
+        return null;
+    }
 
     const width = options.width ?? template.width ?? randomBetween(template.minWidth, template.maxWidth);
     const height = options.height ?? template.height ?? randomBetween(template.minHeight, template.maxHeight);
@@ -385,18 +426,28 @@ function spawnObstacle(templateOverride = null, options = {}) {
     const baseY = WORLD.groundY - height - spawnElevation;
     const defaultStartX = WORLD.width + width + (options.offsetX ?? 0);
     const baseStartX = options.startX ?? defaultStartX;
-    const minGap = options.minGap ?? CONFIG.minObstacleGap;
+    const templateGap = template.minGap ?? CONFIG.minObstacleGap;
+    const minGap = options.minGap ?? templateGap;
     const safeStartX = options.ignoreGlobalGap
         ? baseStartX
         : Math.max(baseStartX, getFurthestObstacleEdge() + minGap);
+    const speedOffset = (() => {
+        if (options.speedOffset !== undefined) return options.speedOffset;
+        if (template.speedOffsetRange) {
+            const [min, max] = template.speedOffsetRange;
+            return randomBetween(min, max);
+        }
+        return template.speedOffset ?? 0;
+    })();
     const obstacle = {
         x: safeStartX,
         y: options.startY ?? baseY,
         width,
         height,
         type: template.name,
+        lane: template.lane ?? "ground",
         hitbox: { ...(template.hitbox ?? {}) },
-        speedOffset: options.speedOffset ?? randomBetween(-40, 40),
+        speedOffset,
         animationTimer: 0,
         flutterSpeed: template.flutterSpeed ?? 0,
         passed: false,
@@ -425,6 +476,57 @@ function spawnObstacle(templateOverride = null, options = {}) {
 
     obstacles.push(obstacle);
     return obstacle;
+}
+
+// Procedure ensures random spawns respect spacing, difficulty, and repetition caps.
+function attemptProceduralSpawn() {
+    const template = pickNextProceduralTemplate();
+    if (!template) return;
+    const minGap = getDynamicMinGap(template);
+    const spawned = spawnObstacle(template, { minGap });
+    if (spawned) {
+        recordSpawnHistory(template.name);
+    }
+}
+
+// Picks a weighted obstacle while avoiding streaks of the same type.
+function pickNextProceduralTemplate() {
+    const difficulty = getDifficultyLevel();
+    const candidates = OBSTACLE_TYPES.filter((type) => {
+        const meetsSpeed = (type.minSpeedMultiplier ?? 0) <= GAME_STATE.speedMultiplier;
+        const meetsDifficulty = (type.minDifficulty ?? 0) <= difficulty;
+        return meetsSpeed && meetsDifficulty;
+    });
+    if (!candidates.length) return null;
+
+    const streakLimitReached =
+        SPAWN_STATE.lastType && SPAWN_STATE.repeatCount >= CONFIG.spawnRules.maxSameTypeStreak;
+    if (streakLimitReached && candidates.length > 1) {
+        const filtered = candidates.filter((type) => type.name !== SPAWN_STATE.lastType);
+        if (filtered.length) {
+            return weightedRandom(filtered);
+        }
+    }
+
+    return weightedRandom(candidates);
+}
+
+// Shrinks obstacle gaps as difficulty rises without crossing the global safety minimum.
+function getDynamicMinGap(template) {
+    const rules = CONFIG.spawnRules;
+    const baseGap = template.minGap ?? CONFIG.minObstacleGap;
+    const reduction = getDifficultyLevel() * rules.gapDecayPerDifficulty;
+    return Math.max(rules.safeMinGap, baseGap - reduction);
+}
+
+// Tracks the last spawned template to block repetitive sequences.
+function recordSpawnHistory(typeName) {
+    if (SPAWN_STATE.lastType === typeName) {
+        SPAWN_STATE.repeatCount += 1;
+    } else {
+        SPAWN_STATE.lastType = typeName;
+        SPAWN_STATE.repeatCount = 1;
+    }
 }
 
 function getFurthestObstacleEdge() {
@@ -460,71 +562,164 @@ function getPatternOrigin(extraGap = CONFIG.minObstacleGap) {
     return ahead;
 }
 
+function canSpawnInLane(lane) {
+    const limit = CONFIG.laneLimits?.[lane] ?? Infinity;
+    if (!Number.isFinite(limit)) return true;
+    let active = 0;
+    for (const obstacle of obstacles) {
+        if (obstacle.lane === lane && !obstacle.passed) {
+            active += 1;
+            if (active >= limit) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+function enqueuePatternSequence(entries = [], initialDelayMs = 0) {
+    if (!entries.length) return;
+    const wasIdle = patternQueue.length === 0;
+    patternQueue.push(...entries);
+    if (wasIdle) {
+        patternQueueDelayMs = Math.max(0, initialDelayMs);
+    }
+}
+
+function processPatternQueue(deltaMs) {
+    if (!patternQueue.length) return false;
+    patternQueueDelayMs = Math.max(0, patternQueueDelayMs - deltaMs);
+    if (patternQueueDelayMs > 0) return true;
+    const next = patternQueue.shift();
+    const template = typeof next.templateName === "string" ? getObstacleTemplateByName(next.templateName) : next.templateName;
+    const options = typeof next.buildOptions === "function" ? next.buildOptions() : { ...(next.options ?? {}) };
+    if (template) {
+        const spawned = spawnObstacle(template, options ?? {});
+        if (!spawned) {
+            patternQueue.unshift(next);
+            patternQueueDelayMs = Math.max(80, next.waitMs ?? 120);
+            return true;
+        }
+    }
+    patternQueueDelayMs = next.waitMs ?? 0;
+    return patternQueue.length > 0 || patternQueueDelayMs > 0;
+}
+
 function spawnTreeVolley() {
-    const spacing = 160;
-    const origin = getPatternOrigin();
+    const spacing = 260;
+    const entries = [];
     for (let i = 0; i < 3; i += 1) {
-        const template = getObstacleTemplateByName(i % 2 === 0 ? "tree-double" : "tree-single");
-        spawnObstacle(template, {
-            startX: origin + i * spacing,
-            ignoreGlobalGap: true,
+        const templateName = i % 2 === 0 ? "tree-double" : "tree-single";
+        const offsetIndex = i;
+        entries.push({
+            templateName,
+            buildOptions: () => {
+                const template = getObstacleTemplateByName(templateName);
+                return {
+                    startX: getPatternOrigin(spacing) + offsetIndex * spacing,
+                    minGap: template?.minGap ?? CONFIG.minObstacleGap,
+                };
+            },
+            waitMs: 240,
         });
     }
+    enqueuePatternSequence(entries);
 }
 
 function spawnPterodactylChase() {
     const template = getObstacleTemplateByName("pterodactyl");
     if (!template) return;
-    const origin = getPatternOrigin();
-    for (let i = 0; i < 4; i += 1) {
-        spawnObstacle(template, {
-            startX: origin + i * 140,
-            startY:
-                WORLD.groundY - template.height - (template.elevationRange?.min ?? 40) - i * 12,
-            speedOffset: -60 + i * 20,
-            ignoreGlobalGap: true,
+    const spacing = 240;
+    const flockSize = 2; // keep aerial formations manageable
+    const entries = [];
+    for (let i = 0; i < flockSize; i += 1) {
+        const offsetIndex = i;
+        entries.push({
+            templateName: "pterodactyl",
+            buildOptions: () => {
+                const tpl = getObstacleTemplateByName("pterodactyl");
+                return {
+                    startX: getPatternOrigin(spacing) + offsetIndex * spacing,
+                    startY:
+                        WORLD.groundY - tpl.height - (tpl.elevationRange?.min ?? 40) - offsetIndex * 12,
+                    speedOffset: -40 + offsetIndex * 20,
+                };
+            },
+            waitMs: 220,
         });
     }
+    enqueuePatternSequence(entries);
 }
 
 function spawnSnowballRush() {
     const template = getObstacleTemplateByName("snowball");
     if (!template) return;
-    const origin = getPatternOrigin();
-    for (let i = 0; i < 3; i += 1) {
-        spawnObstacle(template, {
-            startX: origin + i * 150,
-            speedOffset: -20 + i * 10,
-            ignoreGlobalGap: true,
+    const spacing = 320;
+    const volleySize = 2;
+    const entries = [];
+    for (let i = 0; i < volleySize; i += 1) {
+        const offsetIndex = i;
+        entries.push({
+            templateName: "snowball",
+            buildOptions: () => {
+                const tpl = getObstacleTemplateByName("snowball");
+                return {
+                    startX: getPatternOrigin(spacing) + offsetIndex * spacing,
+                    speedOffset: -20 + offsetIndex * 10,
+                    minGap: tpl.minGap,
+                };
+            },
+            waitMs: 260,
         });
     }
+    enqueuePatternSequence(entries);
 }
 
 function spawnIcicleStorm() {
     const template = getObstacleTemplateByName("icicle");
     if (!template) return;
-    const origin = getPatternOrigin();
+    const spacing = 180;
+    const entries = [];
     for (let i = 0; i < 4; i += 1) {
-        spawnObstacle(template, {
-            startX: origin + i * 120,
-            dropDelay: 120 + i * 70,
-            ignoreGlobalGap: true,
+        const offsetIndex = i;
+        entries.push({
+            templateName: "icicle",
+            buildOptions: () => {
+                const tpl = getObstacleTemplateByName("icicle");
+                return {
+                    startX: getPatternOrigin(spacing) + offsetIndex * spacing,
+                    dropDelay: 120 + offsetIndex * 70,
+                    minGap: tpl?.minGap ?? CONFIG.minObstacleGap,
+                };
+            },
+            waitMs: 180,
         });
     }
+    enqueuePatternSequence(entries);
 }
 
 function spawnMeteorRain() {
     const template = getObstacleTemplateByName("meteor");
     if (!template) return;
-    const origin = getPatternOrigin();
+    const spacing = 200;
+    const entries = [];
     for (let i = 0; i < 4; i += 1) {
-        spawnObstacle(template, {
-            startX: origin + i * 110,
-            startY: 60 + i * 20,
-            verticalSpeed: -180 - i * 20,
-            ignoreGlobalGap: true,
+        const offsetIndex = i;
+        entries.push({
+            templateName: "meteor",
+            buildOptions: () => {
+                const tpl = getObstacleTemplateByName("meteor");
+                return {
+                    startX: getPatternOrigin(spacing) + offsetIndex * spacing,
+                    startY: 60 + offsetIndex * 20,
+                    verticalSpeed: -180 - offsetIndex * 20,
+                    minGap: tpl?.minGap ?? CONFIG.minObstacleGap,
+                };
+            },
+            waitMs: 160,
         });
     }
+    enqueuePatternSequence(entries);
 }
 
 function maybeTriggerPattern() {
@@ -540,6 +735,8 @@ function runPatternForDifficulty() {
     if (!pool.length) return;
     const selection = weightedRandom(pool);
     selection?.handler?.();
+    SPAWN_STATE.lastType = null;
+    SPAWN_STATE.repeatCount = 0;
 }
 
 function update(deltaMs) {
@@ -584,12 +781,15 @@ function update(deltaMs) {
     wasGroundedLastFrame = dino.grounded;
     dino.animationMs += clampedDelta * (dino.grounded ? getEffectiveSpeedMultiplier() : 0.6);
 
-    patternCooldownMs = Math.max(0, patternCooldownMs - clampedDelta);
-    if (patternCooldownMs <= 0) {
-        spawnCountdownMs -= clampedDelta;
-        if (spawnCountdownMs <= 0) {
-            spawnObstacle();
-            scheduleNextSpawn();
+    const patternActive = processPatternQueue(clampedDelta);
+    if (!patternActive) {
+        patternCooldownMs = Math.max(0, patternCooldownMs - clampedDelta);
+        if (patternCooldownMs <= 0) {
+            spawnCountdownMs -= clampedDelta;
+            if (spawnCountdownMs <= 0) {
+                attemptProceduralSpawn();
+                scheduleNextSpawn();
+            }
         }
     }
 
@@ -1731,39 +1931,6 @@ function validateName(rawName) {
     return { valid: true, value: trimmed };
 }
 
-async function checkNameAvailability(candidate, currentName = "") {
-    const normalizedCandidate = candidate.toLowerCase();
-    const normalizedCurrent = (currentName ?? "").toLowerCase();
-    if (normalizedCandidate === normalizedCurrent && normalizedCandidate.length) {
-        return { available: true };
-    }
-    try {
-        const response = await fetch(
-            `${SUPABASE.url}/rest/v1/leaderboard_scores?select=player_name&player_name=ilike.${encodeURIComponent(
-                candidate,
-            )}&limit=1`,
-            {
-                method: "GET",
-                headers: SUPABASE_HEADERS,
-            },
-        );
-        if (!response.ok) {
-            throw new Error(`Failed to check name (${response.status})`);
-        }
-        const data = await response.json();
-        if (!data.length) {
-            return { available: true };
-        }
-        return { available: false, message: "That runner name is already taken." };
-    } catch (error) {
-        console.error("Name availability check failed", error);
-        return {
-            available: false,
-            message: "Couldn't verify the name right now. Please try again.",
-        };
-    }
-}
-
 function initializeNameFlow() {
     if (!nameOverlay || !nameInput) return;
     if (playerName) {
@@ -1774,19 +1941,12 @@ function initializeNameFlow() {
     }
 }
 
-nameForm?.addEventListener("submit", async (event) => {
+nameForm?.addEventListener("submit", (event) => {
     event.preventDefault();
     if (!nameInput) return;
     const validation = validateName(nameInput.value ?? "");
     if (!validation.valid) {
         if (nameError) nameError.textContent = validation.message;
-        return;
-    }
-
-    if (nameError) nameError.textContent = "Checking availability…";
-    const availability = await checkNameAvailability(validation.value, playerName);
-    if (!availability.available) {
-        if (nameError) nameError.textContent = availability.message;
         return;
     }
 
